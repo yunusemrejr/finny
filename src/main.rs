@@ -963,7 +963,11 @@ fn render_markdown(ui: &mut egui::Ui, text: &str) {
                     .show(ui, |ui| {
                         egui::ScrollArea::horizontal()
                             .id_source(format!("code_scroll_{code_idx}"))
-                            .auto_shrink([false, false])
+                            // Shrink vertically to hug the chart (was [false,false]:
+                            // the box claimed all remaining chat height, leaving a
+                            // giant empty frame under short charts). Width stays
+                            // full so wide charts scroll horizontally.
+                            .auto_shrink([false, true])
                             .show(ui, |ui| {
                                 ui.add(
                                     egui::Label::new(
@@ -1003,10 +1007,11 @@ fn render_markdown(ui: &mut egui::Ui, text: &str) {
             continue;
         }
 
-        // Blockquote
+        // Blockquote — fragments flow inline and wrap (horizontal_wrapped).
         if trimmed.starts_with('>') {
             let quote = trimmed.trim_start_matches('>').trim();
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
                 ui.add_space(4.0);
                 ui.colored_label(
                     egui::Color32::from_gray(70),
@@ -1017,10 +1022,11 @@ fn render_markdown(ui: &mut egui::Ui, text: &str) {
             continue;
         }
 
-        // Unordered list
+        // Unordered list — fragments flow inline and wrap.
         if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
             let item = trimmed[2..].trim();
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
                 ui.add_space(8.0);
                 ui.label(egui::RichText::new("• ").size(14.0));
                 render_inline(ui, item, 14.0, false);
@@ -1044,7 +1050,9 @@ fn render_markdown(ui: &mut egui::Ui, text: &str) {
                 ui.horizontal(|ui| {
                     for (i, cell) in cells.iter().enumerate() {
                         if i > 0 {
-                            ui.label(egui::RichText::new(" │ ").size(13.0));
+                            // Monospace: the proportional font lacks U+2502 and
+                            // rendered it as a tofu box.
+                            ui.label(egui::RichText::new("│").monospace().size(13.0));
                         }
                         render_inline(ui, cell, 13.0, false);
                     }
@@ -1064,9 +1072,10 @@ fn render_markdown(ui: &mut egui::Ui, text: &str) {
                 .collect();
             if !cells.is_empty() {
                 ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
                     for (i, cell) in cells.iter().enumerate() {
                         if i > 0 {
-                            ui.label(egui::RichText::new(" │ ").size(13.0));
+                            ui.label(egui::RichText::new("│").monospace().size(13.0));
                         }
                         render_inline(ui, cell, 13.0, false);
                     }
@@ -1108,85 +1117,165 @@ fn render_markdown(ui: &mut egui::Ui, text: &str) {
             continue;
         }
 
-        // Regular paragraph
-        render_inline(ui, trimmed, 14.0, false);
+        // Regular paragraph — bold/italic/code fragments must flow INLINE and
+        // wrap with the text, not stack one-per-line (plain ui.label calls lay
+        // out vertically). horizontal_wrapped + zero spacing = normal prose.
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            render_inline(ui, trimmed, 14.0, false);
+        });
     }
 }
 
-/// Render inline markdown: **bold**, *italic*, `code`.
+/// Render inline markdown: **bold**, *italic*, _italic_, `code` — nestable.
+///
+/// The previous implementation searched for each delimiter TYPE in a fixed
+/// order (` → ** → *), so a later `**bold**` was processed before an earlier
+/// `_italic_` opener and the opener leaked into the literal text (every
+/// `_Source: … **Live network** …_` footer rendered with raw underscores).
+/// This version always processes the EARLIEST opening delimiter, then renders
+/// the span's inner text recursively — so mixed/nested markup just works.
 fn render_inline(ui: &mut egui::Ui, text: &str, size: f32, italic: bool) {
+    render_inline_styled(ui, text, size, italic, false);
+}
+
+fn render_inline_styled(ui: &mut egui::Ui, text: &str, size: f32, italic: bool, bold: bool) {
     let mut remaining = text;
     while !remaining.is_empty() {
-        // Inline code
-        if let Some(start) = remaining.find('`') {
-            let before = &remaining[..start];
-            if let Some(end) = remaining[start + 1..].find('`') {
-                let code = &remaining[start + 1..start + 1 + end];
-                let after = &remaining[start + 1 + end + 1..];
-                if !before.is_empty() {
-                    ui.label(styled_text(before, size, italic, false));
+        match next_span(remaining) {
+            Some((ms, is, ie, me, kind)) => {
+                if ms > 0 {
+                    ui.label(styled_text(&remaining[..ms], size, italic, bold));
                 }
-                ui.monospace(
-                    egui::RichText::new(code)
-                        .size(size - 1.0)
-                        .color(egui::Color32::from_rgb(30, 30, 30))
-                        .background_color(egui::Color32::from_gray(230)),
-                );
-                remaining = after;
-                continue;
+                let inner = &remaining[is..ie];
+                match kind {
+                    SpanKind::Code => {
+                        ui.monospace(
+                            egui::RichText::new(inner)
+                                .size(size - 1.0)
+                                .color(egui::Color32::from_rgb(30, 30, 30))
+                                .background_color(egui::Color32::from_gray(230)),
+                        );
+                    }
+                    SpanKind::Bold => render_inline_styled(ui, inner, size, italic, true),
+                    SpanKind::Italic => render_inline_styled(ui, inner, size, true, bold),
+                }
+                remaining = &remaining[me..];
+            }
+            None => {
+                ui.label(styled_text(remaining, size, italic, bold));
+                break;
             }
         }
-
-        // Bold
-        if let Some(start) = remaining.find("**") {
-            let before = &remaining[..start];
-            if let Some(end) = remaining[start + 2..].find("**") {
-                let bold_text = &remaining[start + 2..start + 2 + end];
-                let after = &remaining[start + 2 + end + 2..];
-                if !before.is_empty() {
-                    ui.label(styled_text(before, size, italic, false));
-                }
-                ui.label(
-                    egui::RichText::new(bold_text)
-                        .size(size)
-                        .strong()
-                        .color(egui::Color32::BLACK),
-                );
-                remaining = after;
-                continue;
-            }
-        }
-
-        // Italic
-        if let Some(start) = remaining.find('*') {
-            let before = &remaining[..start];
-            if let Some(end) = remaining[start + 1..].find('*') {
-                let italic_text = &remaining[start + 1..start + 1 + end];
-                let after = &remaining[start + 1 + end + 1..];
-                if !before.is_empty() {
-                    ui.label(styled_text(before, size, italic, false));
-                }
-                ui.label(
-                    egui::RichText::new(italic_text)
-                        .size(size)
-                        .italics()
-                        .color(egui::Color32::from_gray(40)),
-                );
-                remaining = after;
-                continue;
-            }
-        }
-
-        // No more markdown
-        ui.label(styled_text(remaining, size, italic, false));
-        break;
     }
 }
 
-fn styled_text(text: &str, size: f32, italic: bool, _bold: bool) -> egui::RichText {
+/// Inline span kinds; declaration order doubles as the tie-break priority
+/// (code > bold > italic) when two spans open at the same position.
+#[derive(Clone, Copy, PartialEq)]
+enum SpanKind {
+    Code,
+    Bold,
+    Italic,
+}
+
+/// Find the next complete inline span of any supported kind. Returns
+/// (match_start, inner_start, inner_end, match_end, kind) for the span whose
+/// opening delimiter is earliest, or None when no complete span remains.
+fn next_span(s: &str) -> Option<(usize, usize, usize, usize, SpanKind)> {
+    let mut best: Option<(usize, usize, usize, usize, SpanKind)> = None;
+    {
+        let mut consider = |cand: Option<(usize, usize, usize, usize, SpanKind)>| {
+            if let Some(c) = cand {
+                let better = match &best {
+                    None => true,
+                    Some(b) => c.0 < b.0 || (c.0 == b.0 && (c.4 as u8) < (b.4 as u8)),
+                };
+                if better {
+                    best = Some(c);
+                }
+            }
+        };
+
+        // `code`
+        consider(s.find('`').and_then(|st| {
+            s[st + 1..]
+                .find('`')
+                .map(|en| (st, st + 1, st + 1 + en, st + 1 + en + 1, SpanKind::Code))
+        }));
+        // **bold**
+        consider(s.find("**").and_then(|st| {
+            s[st + 2..]
+                .find("**")
+                .map(|en| (st, st + 2, st + 2 + en, st + 2 + en + 2, SpanKind::Bold))
+        }));
+        // *italic* — single '*' only (never part of a '**' pair)
+        consider(single_delim_span(s, b'*', false).map(
+            |(st, en)| (st, st + 1, en, en + 1, SpanKind::Italic),
+        ));
+        // _italic_ — CommonMark boundary rules (intraword '_' stays literal,
+        // so snake_case like policy_rate is untouched)
+        consider(single_delim_span(s, b'_', true).map(
+            |(st, en)| (st, st + 1, en, en + 1, SpanKind::Italic),
+        ));
+    }
+    best
+}
+
+/// Find a matched pair of single-byte delimiters. With `word_boundaries`
+/// (underscores), an opener must not be intraword and a closer must end a
+/// word — so `policy_rate` stays literal while `_Source: …_` emphasises.
+/// Returns (open_pos, close_pos).
+fn single_delim_span(s: &str, delim: u8, word_boundaries: bool) -> Option<(usize, usize)> {
+    let bytes = s.as_bytes();
+    let is_ws_or_punct = |b: u8| b.is_ascii_whitespace() || b.is_ascii_punctuation();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == delim {
+            let prev_ok = if word_boundaries {
+                // String start is a valid left boundary (e.g. "_Source: …_").
+                i == 0 || is_ws_or_punct(bytes[i - 1])
+            } else {
+                // '*' delimiters: never split a '**' pair
+                i == 0 || bytes[i - 1] != delim
+            };
+            let pair_ok = bytes.get(i + 1).copied() != Some(delim);
+            let next_non_ws = bytes
+                .get(i + 1)
+                .map(|b| !b.is_ascii_whitespace())
+                .unwrap_or(false);
+            if prev_ok && pair_ok && next_non_ws {
+                // Opening found — scan for the closer.
+                let mut j = i + 1;
+                while j < bytes.len() {
+                    if bytes[j] == delim && bytes[j - 1] != delim {
+                        let close_prev_ok = !bytes[j - 1].is_ascii_whitespace();
+                        let close_next_ok = if word_boundaries {
+                            bytes.get(j + 1).copied().map(is_ws_or_punct).unwrap_or(true)
+                        } else {
+                            bytes.get(j + 1).copied() != Some(delim)
+                        };
+                        if close_prev_ok && close_next_ok {
+                            return Some((i, j));
+                        }
+                    }
+                    j += 1;
+                }
+                return None; // opener without closer → literal
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+fn styled_text(text: &str, size: f32, italic: bool, bold: bool) -> egui::RichText {
     let mut rt = egui::RichText::new(text).size(size);
     if italic {
         rt = rt.italics();
+    }
+    if bold {
+        rt = rt.strong();
     }
     rt
 }
@@ -1247,4 +1336,54 @@ fn apply_retro_style(ctx: &egui::Context) {
     v.hyperlink_color = egui::Color32::from_rgb(0, 100, 120);
 
     ctx.set_style(style);
+}
+
+#[cfg(test)]
+mod md_tests {
+    //! Pins for the inline-markdown span parser: the chat renderer's output
+    //! for every assistant message depends on these boundaries.
+    use super::*;
+
+    fn span(s: &str) -> Option<(usize, usize, usize, usize, &'static str)> {
+        next_span(s).map(|(a, b, c, d, k)| {
+            (a, b, c, d, match k {
+                SpanKind::Code => "code",
+                SpanKind::Bold => "bold",
+                SpanKind::Italic => "italic",
+            })
+        })
+    }
+
+    #[test]
+    fn underscore_italic_at_string_start() {
+        // The dialogue footer's exact shape — opener at position 0 must match.
+        let s = "_Source: BLS · figures are approximate._";
+        let (ms, is, ie, me, k) = span(s).unwrap();
+        assert_eq!((ms, is, ie, me, k), (0, 1, s.len() - 1, s.len(), "italic"));
+        assert_eq!(&s[is..ie], "Source: BLS · figures are approximate.");
+    }
+
+    #[test]
+    fn intraword_underscore_stays_literal() {
+        assert!(span("policy_rate").is_none());
+        assert!(span("show policy_rate trend").is_none());
+    }
+
+    #[test]
+    fn earliest_delimiter_wins_over_type_priority() {
+        // '_' at 0 must beat '**' at 11 (the old renderer processed bold first
+        // and leaked the underscore opener into literal text).
+        let s = "_figures — enable **Live network** for data._";
+        let (ms, _, _, _, k) = span(s).unwrap();
+        assert_eq!((ms, k), (0, "italic"));
+    }
+
+    #[test]
+    fn bold_code_and_star_italic() {
+        assert_eq!(span("a **b** c").map(|(a, _, _, _, k)| (a, k)), Some((2, "bold")));
+        assert_eq!(span("a `b` c").map(|(a, _, _, _, k)| (a, k)), Some((2, "code")));
+        assert_eq!(span("a *b* c").map(|(a, _, _, _, k)| (a, k)), Some((2, "italic")));
+        // '**' is never mistaken for two single-'*' italics.
+        assert_eq!(span("**bold**").map(|(_, _, _, _, k)| k), Some("bold"));
+    }
 }

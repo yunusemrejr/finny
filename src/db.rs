@@ -204,3 +204,53 @@ impl Db {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The in-app "Clear data" action, exercised on a THROWAWAY database
+    /// (constructed by path directly — no process-global FINNY_DATA_DIR, so
+    /// this never races the engine tests and never touches real user data).
+    #[test]
+    fn clear_all_data_wipes_rows_but_keeps_working_db() {
+        let dir = std::env::temp_dir().join(format!("finny_dbtest_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db { path: dir.join("finny.db") };
+        db.init().unwrap();
+
+        let s = db.create_session("chat").unwrap();
+        let msg = |text: &str, sid: i64| Message {
+            id: None,
+            ts: Utc::now(),
+            role: "user".into(),
+            text: text.into(),
+            session_id: sid,
+            intent: None,
+            query_plan: None,
+        };
+        db.add_message(&msg("hello", s.id)).unwrap();
+        db.add_source(&Source {
+            id: None,
+            url: "https://example.test".into(),
+            retrieved_at: Utc::now(),
+            domain_tier: 1,
+            purpose: "test".into(),
+        })
+        .unwrap();
+        assert_eq!(db.messages_for(s.id).unwrap().len(), 1);
+
+        db.clear_all_data().unwrap();
+
+        // Everything disposable is gone…
+        assert!(db.messages_for(s.id).unwrap().is_empty());
+        assert!(db.list_sessions(false).unwrap().len() == 1, "one fresh session auto-created");
+        // …and the database keeps working — a clean first-run state.
+        let fresh = db.list_sessions(false).unwrap()[0].id;
+        db.add_message(&msg("after wipe", fresh)).unwrap();
+        assert_eq!(db.messages_for(fresh).unwrap().len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

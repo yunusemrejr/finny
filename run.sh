@@ -169,9 +169,11 @@ if [ -d /opt/data/home/userlibs ]; then
     export LD_LIBRARY_PATH="/opt/data/home/userlibs:/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-}"
 fi
 
-# Prefer a prebuilt release binary; build once if absent.
-if [ ! -x ./target/release/finny ]; then
-    log "Building release binary (first run, ~1–2 min)…"
+# Build when the binary is missing OR stale — i.e. any source/manifest file is
+# newer than the binary (the usual case after a `git pull`). Without the
+# staleness check a pulled update would silently keep running the old build.
+if [ ! -x ./target/release/finny ] || [ -n "$(find src Cargo.toml -newer ./target/release/finny -print -quit 2>/dev/null)" ]; then
+    log "Building release binary (~1–2 min)…"
     cargo build --release
 fi
 
