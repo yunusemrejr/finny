@@ -1,5 +1,41 @@
 use crate::intent::SlotBindings;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+
+/// FX rates as "units of currency per 1 USD" plus a provenance label, handed
+/// to the currency converter. Produced live by the engine (frankfurter.app →
+/// open.er-api.com, cached) or from the local reference table when offline.
+pub struct FxTable {
+    pub rates: HashMap<String, f64>,
+    /// Human-readable source, e.g. "frankfurter.app (ECB reference, 2026-07-22)"
+    /// or "approximate reference rates (offline)". Shown in the answer footer.
+    pub source: String,
+}
+
+/// Local reference rates (units per 1 USD) — the offline fallback. These are
+/// approximate and clearly labelled as such wherever they are used.
+pub fn reference_fx_rates() -> HashMap<String, f64> {
+    [
+        ("USD", 1.0),
+        ("EUR", 0.92),
+        ("JPY", 155.0),
+        ("GBP", 0.79),
+        ("CHF", 0.88),
+        ("CAD", 1.36),
+        ("AUD", 1.53),
+        ("CNY", 7.24),
+        ("INR", 83.0),
+        ("TRY", 32.0),
+    ]
+    .iter()
+    .map(|(k, v)| (k.to_string(), *v))
+    .collect()
+}
+
+/// True when a calculation query is a currency conversion — the engine uses
+/// this to decide whether a live FX fetch is worthwhile before planning.
+pub fn is_conversion_query(lower: &str) -> bool {
+    lower.contains("convert")
+}
 
 #[derive(Clone)]
 pub struct QueryPlanner;
@@ -7,11 +43,21 @@ pub struct QueryPlanner;
 impl QueryPlanner {
     pub fn new() -> Self { Self }
     pub fn plan_and_answer(&self, slots: &SlotBindings, question: &str) -> String {
+        self.plan_and_answer_with_fx(slots, question, None)
+    }
+    /// As `plan_and_answer`, but the currency converter uses the supplied FX
+    /// table (live rates) instead of the local reference table when given.
+    pub fn plan_and_answer_with_fx(
+        &self,
+        slots: &SlotBindings,
+        question: &str,
+        fx: Option<&FxTable>,
+    ) -> String {
         use crate::intent::IntentClass;
         match &slots.intent {
             IntentClass::DirectLookup => self.direct_lookup(slots),
             IntentClass::Comparison(parts) => self.compare(slots, parts),
-            IntentClass::Calculation => self.calculate(slots, question),
+            IntentClass::Calculation => self.calculate(slots, question, fx),
             IntentClass::CausalScenario => self.scenario(slots, question),
             IntentClass::Definition => self.define_term(question),
             IntentClass::AssetPrice => self.asset_price(slots, question),
@@ -136,7 +182,7 @@ impl QueryPlanner {
         out.push_str("```\n\nFigures are approximate reference values. Enable Network for live prices.\n");
         out
     }
-    fn calculate(&self, _s: &SlotBindings, q: &str) -> String {
+    fn calculate(&self, _s: &SlotBindings, q: &str, fx: Option<&FxTable>) -> String {
         let lower = q.to_lowercase();
         if lower.contains("amort") || lower.contains("amortization") || lower.contains("loan schedule") { self.amortization_schedule(&lower) }
         else if lower.contains("bond") || lower.contains("duration") { self.bond(&lower) }
@@ -156,7 +202,7 @@ impl QueryPlanner {
         else if lower.contains("portfolio variance") || lower.contains("portfolio risk") { self.portfolio_variance(&lower) }
         else if lower.contains("break-even") || lower.contains("break even") { self.break_even(&lower) }
         else if lower.contains("wacc") || lower.contains("weighted average cost of capital") { self.wacc(&lower) }
-        else if lower.contains("convert") { self.convert_currency(&lower) }
+        else if is_conversion_query(&lower) { self.convert_currency(&lower, fx) }
         else { "I couldn't parse a supported formula. Try one of:\\n
 - Currency conversion: 'convert 100 USD to EUR' or 'convert 50000 JPY to USD'".to_string() }
     }
@@ -215,6 +261,9 @@ impl QueryPlanner {
         let from = regex_or(lower, r"(?:from|@)\s*([\d\.]+)", 150.0);
         let to = regex_or(lower, r"(?:to|→)\s*([\d\.]+)", 155.0);
         let pct = (to - from) / from * 100.0;
+        if !pct.is_finite() {
+            return "That percentage change is undefined (the 'from' value was zero). Try a non-zero starting value.".to_string();
+        }
         format!("# FX Percentage Change\n\n## Inputs\n- From: {}\n- To: {}\n\n## Formula\n%Δ = (to − from) / from × 100\n%Δ = ({} − {}) / {} × 100\n\n## Result\n%Δ = {:.3}%\n\n## Interpretation\nA {:.2}% {} in the quoted pair.", from, to, to, from, from, pct, pct.abs(), if pct > 0.0 { "appreciation" } else { "depreciation" })
     }
     fn cagr(&self, lower: &str) -> String {
@@ -222,6 +271,9 @@ impl QueryPlanner {
         let end = regex_or(lower, r"(?:to|→)\s*(\d+)", 2000.0);
         let years = regex_or(lower, r"over\s*(\d+)", 5.0);
         let cagr = ((end / start).powf(1.0 / years) - 1.0) * 100.0;
+        if !cagr.is_finite() {
+            return "CAGR is undefined for a zero start value or zero years — check your inputs.".to_string();
+        }
         format!("# CAGR (Compound Annual Growth Rate)\n\n## Inputs\n- Starting value: {}\n- Ending value: {}\n- Period: {} years\n\n## Formula\nCAGR = (end / start)^(1/years) − 1\nCAGR = ({}/{})^(1/{}) − 1\n\n## Result\nCAGR ≈ {:.2}%", start, end, years, end, start, years, cagr)
     }
     fn mortgage(&self, lower: &str) -> String {
@@ -258,30 +310,45 @@ impl QueryPlanner {
         let price = regex_or(lower, r"price\s*([\d\.]+)", 150.0);
         let eps = regex_or(lower, r"eps\s*([\d\.]+)", 10.0);
         let pe = price / eps;
+        if !pe.is_finite() {
+            return "P/E is undefined when EPS is zero — the company has no earnings. Try a non-zero EPS.".to_string();
+        }
         format!("# P/E Ratio (Price-to-Earnings)\n\n## Inputs\n- Stock price: ${:.2}\n- EPS (earnings per share): ${:.2}\n\n## Formula\nP/E = Price / EPS\nP/E = {:.2} / {:.2}\n\n## Result\nP/E ratio = {:.2}\n\n## Interpretation\n- P/E > 20: potentially overvalued or high growth\n- P/E < 10: potentially undervalued or low growth\n- Compare against industry average", price, eps, price, eps, pe)
     }
     fn debt_equity(&self, lower: &str) -> String {
         let debt = regex_or(lower, r"debt\s*([\d\.]+)", 500000.0);
         let equity = regex_or(lower, r"equity\s*([\d\.]+)", 1000000.0);
         let ratio = debt / equity;
+        if !ratio.is_finite() {
+            return "D/E ratio is undefined when equity is zero — try a non-zero equity value.".to_string();
+        }
         format!("# Debt-to-Equity Ratio\n\n## Inputs\n- Total debt: ${:.0}\n- Total equity: ${:.0}\n\n## Formula\nD/E = Total Debt / Total Equity\nD/E = {:.0} / {:.0}\n\n## Result\nD/E ratio = {:.2}\n\n## Interpretation\n- D/E < 1: conservative leverage\n- D/E > 2: aggressive leverage\n- Varies by industry", debt, equity, debt, equity, ratio)
     }
     fn current_ratio(&self, lower: &str) -> String {
         let assets = regex_or(lower, r"assets\s*([\d\.]+)", 200000.0);
         let liabilities = regex_or(lower, r"liabilities\s*([\d\.]+)", 100000.0);
         let ratio = assets / liabilities;
+        if !ratio.is_finite() {
+            return "Current ratio is undefined when current liabilities are zero — there is nothing to divide by.".to_string();
+        }
         format!("# Current Ratio\n\n## Inputs\n- Current assets: ${:.0}\n- Current liabilities: ${:.0}\n\n## Formula\nCurrent Ratio = Current Assets / Current Liabilities\nCurrent Ratio = {:.0} / {:.0}\n\n## Result\nCurrent ratio = {:.2}\n\n## Interpretation\n- Ratio > 1: can cover short-term obligations\n- Ratio < 1: potential liquidity risk\n- Ideal range: 1.5–3.0", assets, liabilities, assets, liabilities, ratio)
     }
     fn roe(&self, lower: &str) -> String {
         let income = regex_or(lower, r"income\s*([\d\.]+)", 50000.0);
         let equity = regex_or(lower, r"equity\s*([\d\.]+)", 250000.0);
         let roe = (income / equity) * 100.0;
+        if !roe.is_finite() {
+            return "ROE is undefined when equity is zero — try a non-zero equity value.".to_string();
+        }
         format!("# Return on Equity (ROE)\n\n## Inputs\n- Net income: ${:.0}\n- Shareholders' equity: ${:.0}\n\n## Formula\nROE = (Net Income / Equity) × 100\nROE = ({:.0} / {:.0}) × 100\n\n## Result\nROE = {:.2}%\n\n## Interpretation\n- ROE > 15%: strong profitability\n- ROE < 10%: below average\n- Compare against industry peers", income, equity, income, equity, roe)
     }
     fn dividend_yield(&self, lower: &str) -> String {
         let dividend = regex_or(lower, r"dividend\s*([\d\.]+)", 4.0);
         let price = regex_or(lower, r"price\s*([\d\.]+)", 100.0);
         let yield_pct = (dividend / price) * 100.0;
+        if !yield_pct.is_finite() {
+            return "Dividend yield is undefined when the price is zero — try a non-zero price.".to_string();
+        }
         format!("# Dividend Yield\n\n## Inputs\n- Annual dividend per share: ${:.2}\n- Stock price: ${:.2}\n\n## Formula\nDividend Yield = (Annual Dividend / Price) × 100\nDividend Yield = ({:.2} / {:.2}) × 100\n\n## Result\nDividend yield = {:.2}%\n\n## Interpretation\n- Yield > 4%: high income potential\n- Yield < 2%: growth-oriented stock\n- Ensure dividend is sustainable", dividend, price, dividend, price, yield_pct)
     }
     fn black_scholes(&self, lower: &str) -> String {
@@ -301,6 +368,9 @@ impl QueryPlanner {
         let risk_free_rate = regex_or(lower, r"risk.?free\s*([\d\.]+)", 3.0);
         let std_dev = regex_or(lower, r"dev(?:iation)?\s*([\d\.]+)", 15.0);
         let sharpe = (expected_return - risk_free_rate) / std_dev;
+        if !sharpe.is_finite() {
+            return "Sharpe ratio is undefined with a standard deviation of zero — there is no volatility to divide by.".to_string();
+        }
         format!("# Sharpe Ratio\n\n## Inputs\n- Expected return: {:.2}%\n- Risk-free rate: {:.2}%\n- Standard deviation: {:.2}%\n\n## Formula\nSharpe = (Rₚ − Rբ) / σ\nSharpe = ({:.2} − {:.2}) / {:.2}\n\n## Result\nSharpe ratio = {:.2}\n\n## Interpretation\n- Sharpe > 1: good risk-adjusted return\n- Sharpe > 2: very good\n- Sharpe > 3: excellent\n- Sharpe < 0: worse than risk-free", expected_return, risk_free_rate, std_dev, expected_return, risk_free_rate, std_dev, sharpe)
     }
     fn portfolio_variance(&self, lower: &str) -> String {
@@ -318,6 +388,9 @@ impl QueryPlanner {
         let price = regex_or(lower, r"price\s*([\d\.]+)", 50.0);
         let variable = regex_or(lower, r"variable\s*([\d\.]+)", 30.0);
         let contribution = price - variable;
+        if contribution <= 0.0 {
+            return format!("# Break-Even Analysis\n\n## Inputs\n- Fixed costs: ${:.0}\n- Price per unit: ${:.2}\n- Variable cost per unit: ${:.2}\n\n## Result\nNo break-even point: the contribution margin (price − variable cost = ${:.2}) is not positive. Each unit sold loses money, so no sales volume can cover the fixed costs.", fixed, price, variable, contribution);
+        }
         let break_even_units = fixed / contribution;
         let break_even_revenue = break_even_units * price;
         format!("# Break-Even Analysis\n\n## Inputs\n- Fixed costs: ${:.0}\n- Price per unit: ${:.2}\n- Variable cost per unit: ${:.2}\n\n## Formula\nContribution margin = Price − Variable cost = ${:.2}\nBreak-even (units) = Fixed costs / Contribution margin\nBreak-even (units) = {:.0} / {:.2}\n\n## Result\nBreak-even point = {:.0} units\nBreak-even revenue = ${:.2}\n\n## Interpretation\nYou need to sell {:.0} units to cover all costs.\nEvery unit beyond this contributes ${:.2} to profit.", fixed, price, variable, contribution, fixed, contribution, break_even_units, break_even_revenue, break_even_units, contribution)
@@ -341,7 +414,7 @@ impl QueryPlanner {
         let interest = amount - principal;
         format!("# Compound Interest\n\n## Inputs\n- Principal: ${:.0}\n- Annual rate: {:.2}%\n- Period: {} years\n- Compounding: {} times/year\n\n## Formula\nA = P(1 + r/n)^(nt)\nA = {:.0}(1 + {:.4}/{})^({}×{})\n\n## Result\nFinal amount: ${:.2}\nInterest earned: ${:.2}\n\n## Note\nThe power of compounding: interest earns interest.", principal, rate*100.0, years as i64, n as i64, principal, rate, n as i64, n as i64, years as i64, amount, interest)
     }
-    fn convert_currency(&self, lower: &str) -> String {
+    fn convert_currency(&self, lower: &str, fx: Option<&FxTable>) -> String {
         // Parse amount and source currency together (amount followed by currency code)
         let re = regex::Regex::new(r"(\d+(?:\.\d+)?)\s*(usd|eur|jpy|gbp|chf|cad|aud|cny|inr|try)").ok();
         let (amount, from_curr) = if let Some(ref r) = re {
@@ -369,30 +442,42 @@ impl QueryPlanner {
             else if lower.contains("to usd") || lower.contains("in usd") || lower.contains("-> usd") { "USD" }
             else { "EUR" }; // default
         
-        // Rate matrix: units of currency per 1 USD
+        // Rates: live table when the engine supplied one, else the local
+        // reference table. A currency missing from a live table falls back to
+        // its reference rate so an exotic gap never breaks a conversion.
+        let reference = reference_fx_rates();
         let rate = |c: &str| -> f64 {
-            match c {
-                "USD" => 1.0,
-                "EUR" => 0.92,
-                "JPY" => 155.0,
-                "GBP" => 0.79,
-                "CHF" => 0.88,
-                "CAD" => 1.36,
-                "AUD" => 1.53,
-                "CNY" => 7.24,
-                "INR" => 83.0,
-                "TRY" => 32.0,
-                _ => 1.0,
-            }
+            fx.and_then(|t| t.rates.get(c).copied())
+                .or_else(|| reference.get(c).copied())
+                .unwrap_or(1.0)
+        };
+        let (source_note, matrix_title) = match fx {
+            Some(t) => (
+                format!("Live rates: {}. Any missing currency uses the local reference rate.", t.source),
+                "Rate Matrix (per 1 USD, live)",
+            ),
+            None => (
+                "Rates are approximate reference values (offline). Enable Live network for real-time rates.".to_string(),
+                "Rate Matrix (per 1 USD, reference)",
+            ),
         };
         
         let from_rate = rate(&from_curr);
         let to_rate = rate(&to_curr);
         let usd_amount = amount / from_rate;
         let result = usd_amount * to_rate;
+        if !result.is_finite() {
+            return "I couldn't compute that conversion (a rate resolved to zero). Please check the currencies and try again.".to_string();
+        }
+
+        // Show the rates actually used (live or reference), not a stale constant.
+        let mut matrix = String::new();
+        for c in ["USD", "EUR", "JPY", "GBP", "CHF", "CAD", "AUD", "CNY", "INR", "TRY"] {
+            matrix.push_str(&format!("| {} | {:.4} |\n", c, rate(c)));
+        }
         
-        format!("# Currency Conversion\n\n## Inputs\n- Amount: {:.2} {}\n- Convert to: {}\n\n## Rate Matrix (per 1 USD)\n| Currency | Rate |\n|----------|------|\n| USD | 1.0000 |\n| EUR | 0.9200 |\n| JPY | 155.00 |\n| GBP | 0.7900 |\n| CHF | 0.8800 |\n| CAD | 1.3600 |\n| AUD | 1.5300 |\n| CNY | 7.2400 |\n| INR | 83.00 |\n| TRY | 32.00 |\n\n## Calculation\n{:.2} {} → USD → {}\n{:.2} / {:.4} × {:.4} = {:.2}\n\n## Result\n{:.2} {} = {:.2} {}\n\n## Note\nRates are approximate reference values. For live rates, enable Network mode.\n\n**Source**: Approximate interbank reference rates.", 
-            amount, from_curr, to_curr, amount, from_curr, to_curr, amount, from_rate, to_rate, result, amount, from_curr, result, to_curr)
+        format!("# Currency Conversion\n\n## Inputs\n- Amount: {:.2} {}\n- Convert to: {}\n\n## {}\n| Currency | Rate |\n|----------|------|\n{}\n## Calculation\n{:.2} {} → USD → {}\n{:.2} / {:.4} × {:.4} = {:.2}\n\n## Result\n{:.2} {} = {:.2} {}\n\n## Note\n{}\n\n**Source**: {}", 
+            amount, from_curr, to_curr, matrix_title, matrix, amount, from_curr, to_curr, amount, from_rate, to_rate, result, amount, from_curr, result, to_curr, source_note, fx.map(|t| t.source.as_str()).unwrap_or("Approximate interbank reference rates."))
     }
     fn trend(&self, s: &SlotBindings, _question: &str) -> String {
         let subj = s.subject.as_deref().unwrap_or("metric");
@@ -883,7 +968,7 @@ impl QueryPlanner {
         } else { "My registry only models yen-carry scenarios directly. Ask 'how could yen appreciation affect carry trades?'".to_string() }
     }
     fn unsupported(&self, q: &str) -> String {
-        format!("Finn refuses to hallucinate this answer: \"{}\"\n\nSupported queries:\n- latest METRIC for COUNTRY\n- compare METRIC across COUNTRY_LIST\n- calculate X given Y\n- explain likely effects of EVENT on ASSET\n- define FINANCE_TERM", q.trim())
+        format!("I don't have reliable data for \"{}\" and I won't guess.\n\nSupported queries:\n- latest METRIC for COUNTRY\n- compare METRIC across COUNTRY_LIST\n- calculate X given Y\n- explain likely effects of EVENT on ASSET\n- define FINANCE_TERM", q.trim())
     }
     fn define_term(&self, q: &str) -> String {
         let lower = q.to_lowercase();
@@ -944,16 +1029,26 @@ fn sqrt(x: f64) -> f64 { x.sqrt() }
 #[allow(dead_code)]
 fn ln(x: f64) -> f64 { x.ln() }
 
+/// Standard normal CDF N(x) via erf. The previous implementation summed the
+/// WRONG Taylor series (term recurrence missed the 2^k·k! factor, producing a
+/// Dawson-like series: N(1)=0.789 instead of 0.841, N(2)=0.755 instead of
+/// 0.977) which silently mispriced every Black-Scholes result.
 fn normal_cdf(x: f64) -> f64 {
-    const SQRT_2PI: f64 = 2.5066282746310002;
-    let mut sum = 0.0;
-    let mut term = x;
-    for i in 1..=100 {
-        sum += term;
-        let n = (2 * i + 1) as f64;
-        term = -term * x * x / n;
-    }
-    0.5 + sum / SQRT_2PI
+    0.5 * (1.0 + erf(x / std::f64::consts::SQRT_2))
+}
+
+/// Abramowitz & Stegun 7.1.26 polynomial approximation of erf(x).
+/// Max absolute error 1.5e-7 over all x — far tighter than option pricing needs.
+fn erf(x: f64) -> f64 {
+    let sign = if x < 0.0 { -1.0 } else { 1.0 };
+    let x = x.abs();
+    let t = 1.0 / (1.0 + 0.3275911 * x);
+    let y = 1.0
+        - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t
+            + 0.254829592)
+            * t
+            * (-x * x).exp();
+    sign * y
 }
 
 /// Render an ASCII line chart from time-series data.
@@ -1041,3 +1136,105 @@ fn render_ascii_chart(data: &[(String, f64)], title: &str, unit: &str) -> String
         out.push_str("```\n");
         out
     }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- normal_cdf / Black-Scholes: pins for the fixed Taylor-series bug ---
+    // True values from standard normal tables.
+    #[test]
+    fn normal_cdf_matches_standard_tables() {
+        let cases = [
+            (0.0, 0.5000000),
+            (1.0, 0.8413447),
+            (-1.0, 0.1586553),
+            (1.96, 0.9750021),
+            (-2.0, 0.0227501),
+            (3.0, 0.9986501),
+        ];
+        for (x, expected) in cases {
+            let got = normal_cdf(x);
+            assert!(
+                (got - expected).abs() < 1e-5,
+                "N({}) = {} but expected {}",
+                x, got, expected
+            );
+        }
+    }
+
+    #[test]
+    fn black_scholes_atm_matches_textbook() {
+        // S=K=100, T=1, r=5%, vol=20% → call 10.4506, put 5.5735 (textbook).
+        let p = QueryPlanner::new();
+        let out = p.black_scholes("stock 100 strike 100 time 1 rate 5 vol 20");
+        assert!(out.contains("Call option: $10.45"), "call wrong: {}", out);
+        assert!(out.contains("Put option: $5.57"), "put wrong: {}", out);
+    }
+
+    // --- Division-by-zero guards: friendly message, never "inf"/"NaN" ---
+    #[test]
+    fn break_even_zero_margin_is_explained() {
+        let p = QueryPlanner::new();
+        let out = p.break_even("fixed costs 10000 price 50 variable 50");
+        assert!(out.contains("No break-even point"), "guard missing: {}", out);
+        assert!(!out.contains("inf"), "inf leaked: {}", out);
+    }
+
+    #[test]
+    fn pe_ratio_zero_eps_is_explained() {
+        let p = QueryPlanner::new();
+        let out = p.pe_ratio("price 150 eps 0");
+        assert!(out.contains("undefined"), "guard missing: {}", out);
+        assert!(!out.contains("inf"), "inf leaked: {}", out);
+    }
+
+    #[test]
+    fn sharpe_zero_dev_is_explained() {
+        let p = QueryPlanner::new();
+        let out = p.sharpe_ratio("return 10 risk-free 3 dev 0");
+        assert!(out.contains("undefined"), "guard missing: {}", out);
+        assert!(!out.contains("NaN"), "NaN leaked: {}", out);
+    }
+
+    // --- Currency conversion: reference vs live FX table ---
+    #[test]
+    fn conversion_uses_reference_rates_offline() {
+        let p = QueryPlanner::new();
+        let out = p.convert_currency("convert 100 usd to eur", None);
+        assert!(out.contains("92.00 EUR"), "reference result missing: {}", out);
+        assert!(out.contains("reference"), "should be labelled reference: {}", out);
+    }
+
+    #[test]
+    fn conversion_uses_live_rates_when_supplied() {
+        let p = QueryPlanner::new();
+        let mut rates = reference_fx_rates();
+        rates.insert("EUR".into(), 0.85);
+        let fx = FxTable { rates, source: "frankfurter.app (test)".into() };
+        let out = p.convert_currency("convert 100 usd to eur", Some(&fx));
+        assert!(out.contains("85.00 EUR"), "live result missing: {}", out);
+        assert!(out.contains("frankfurter.app (test)"), "source missing: {}", out);
+        assert!(out.contains("Live rates"), "not labelled live: {}", out);
+    }
+
+    #[test]
+    fn conversion_missing_currency_falls_back_to_reference() {
+        let p = QueryPlanner::new();
+        // Live table with ONLY EUR — TRY must fall back to its reference rate.
+        let mut rates = std::collections::HashMap::new();
+        rates.insert("USD".to_string(), 1.0);
+        rates.insert("EUR".to_string(), 0.85);
+        let fx = FxTable { rates, source: "partial feed".into() };
+        let out = p.convert_currency("convert 100 usd to try", Some(&fx));
+        assert!(out.contains("3200.00 TRY"), "reference fallback failed: {}", out);
+    }
+
+    #[test]
+    fn unsupported_copy_is_friendly_and_branded() {
+        let p = QueryPlanner::new();
+        let out = p.unsupported("some hidden order book question");
+        assert!(out.contains("I don't have reliable data"), "copy: {}", out);
+        assert!(!out.contains("Finn "), "typo still present: {}", out);
+    }
+}

@@ -9,7 +9,8 @@ use crate::retrieval::Retriever;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// Result of one chat turn.
 #[derive(Clone, Debug)]
@@ -26,6 +27,8 @@ pub struct Engine {
     pub nlu: crate::nlu::Nlu,
     pub planner: QueryPlanner,
     pub use_network: Arc<AtomicBool>,
+    /// Cached live FX rates (TTL 1h) so repeated conversions don't re-hit the net.
+    fx_cache: Arc<Mutex<Option<(Instant, crate::retrieval::FxRates)>>>,
 }
 
 impl Engine {
@@ -39,6 +42,7 @@ impl Engine {
             nlu: crate::nlu::Nlu::new(),
             planner: QueryPlanner::new(),
             use_network: Arc::new(AtomicBool::new(network_enabled)),
+            fx_cache: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -58,7 +62,28 @@ impl Engine {
         };
         let mut answer = match chitchat_kind {
             Some(kind) => crate::dialogue::chitchat_reply(kind, text),
-            None => self.planner.plan_and_answer(&slots, text),
+            None => {
+                // Currency conversions get live rates (cached ≤1h) when the
+                // network is on — every other query stays fully deterministic.
+                let live_fx = if matches!(slots.intent, crate::intent::IntentClass::Calculation)
+                    && crate::planner::is_conversion_query(&text.to_lowercase())
+                    && self.use_network.load(Ordering::Relaxed)
+                {
+                    self.fresh_fx().map(|fx| {
+                        self.persist_source(&fx.source_url, &fx.sha256, fx.retrieved_at);
+                        crate::planner::FxTable {
+                            rates: fx.per_usd.clone(),
+                            source: format!(
+                                "frankfurter.app (ECB reference, fetched {} UTC)",
+                                fx.retrieved_at.format("%Y-%m-%d %H:%M")
+                            ),
+                        }
+                    })
+                } else {
+                    None
+                };
+                self.planner.plan_and_answer_with_fx(&slots, text, live_fx.as_ref())
+            }
         };
 
         // Network-augmented intents: anything that asks for current or
@@ -78,74 +103,53 @@ impl Engine {
             let keywords = self.excerpt_keywords(&slots);
             let mut fetched = false;
 
-            // Phase 1: fetch from known central-bank / stats-agency pages.
-            if let Some(cands) = self.lookup_candidate_urls(&slots) {
-                for url in cands {
-                    if let Ok(page) = self.retriever.fetch(&url) {
-                        let body = crate::retrieval::html_to_text(&page.body);
-                        let excerpts = crate::retrieval::excerpts_around_keywords(
-                            &body,
-                            &keywords,
-                            3,
-                            150,
-                        );
-                        if !excerpts.is_empty() {
-                            self.persist_source(
-                                &page.url,
-                                &page.content_sha256,
-                                page.retrieved_at,
-                            );
-                            let s = format!(
-                                "\n\n## Live Excerpts ({})\n{}",
-                                page.url,
-                                excerpts
-                                    .iter()
-                                    .map(|e| format!("> {}", e))
-                                    .collect::<Vec<_>>()
-                                    .join("\n\n")
-                            );
-                            answer.push_str(&s);
-                            sources.push(page.url);
-                            fetched = true;
-                            break;
-                        }
-                    }
+            // JSON APIs are tried FIRST: they are small, fast, structured and
+            // bounded (4s client). The slow HTML scrape runs LAST and only if
+            // no JSON source answered — this stops the UI worker from "wandering"
+            // through flaky pages when a clean API answer is available.
+
+            // Phase 1: World Bank API — broad country × indicator coverage.
+            if let Some((country, indicator)) = self.lookup_worldbank(&slots) {
+                if let Ok(data) = self.retriever.fetch_worldbank(country, indicator) {
+                    self.persist_source(&data.source_url, &data.sha256, data.retrieved_at);
+                    answer.push_str(&format!("\n\n## Live Data (World Bank API)\n{}", data.text));
+                    sources.push(data.source_url);
+                    fetched = true;
                 }
             }
 
-            // Phase 2: World Bank API — broad country × indicator coverage.
+            // Phase 2: BLS Public API — detailed US economic series.
             if !fetched {
-                if let Some((country, indicator)) = self.lookup_worldbank(&slots) {
-                    if let Ok(data) = self.retriever.fetch_worldbank(country, indicator) {
-                        self.persist_source(
-                            &data.source_url,
-                            &data.sha256,
-                            data.retrieved_at,
-                        );
-                        answer.push_str(&format!(
-                            "\n\n## Live Data (World Bank API)\n{}",
-                            data.text
-                        ));
+                if let Some(series) = self.lookup_bls(&slots) {
+                    if let Ok(data) = self.retriever.fetch_bls(series) {
+                        self.persist_source(&data.source_url, &data.sha256, data.retrieved_at);
+                        answer.push_str(&format!("\n\n## Live Data (BLS Public API)\n{}", data.text));
                         sources.push(data.source_url);
                         fetched = true;
                     }
                 }
             }
 
-            // Phase 3: BLS Public API — detailed US economic series.
+            // Phase 3 (fallback): scrape known central-bank / stats-agency pages.
             if !fetched {
-                if let Some(series) = self.lookup_bls(&slots) {
-                    if let Ok(data) = self.retriever.fetch_bls(series) {
-                        self.persist_source(
-                            &data.source_url,
-                            &data.sha256,
-                            data.retrieved_at,
-                        );
-                        answer.push_str(&format!(
-                            "\n\n## Live Data (BLS Public API)\n{}",
-                            data.text
-                        ));
-                        sources.push(data.source_url);
+                if let Some(cands) = self.lookup_candidate_urls(&slots) {
+                    for url in cands {
+                        if let Ok(page) = self.retriever.fetch(&url) {
+                            let body = crate::retrieval::html_to_text(&page.body);
+                            let excerpts = crate::retrieval::excerpts_around_keywords(
+                                &body, &keywords, 3, 150,
+                            );
+                            if !excerpts.is_empty() {
+                                self.persist_source(&page.url, &page.content_sha256, page.retrieved_at);
+                                answer.push_str(&format!(
+                                    "\n\n## Live Excerpts ({})\n{}",
+                                    page.url,
+                                    excerpts.iter().map(|e| format!("> {}", e)).collect::<Vec<_>>().join("\n\n")
+                                ));
+                                sources.push(page.url);
+                                break;
+                            }
+                        }
                     }
                 }
             }
@@ -225,11 +229,68 @@ impl Engine {
         self.db.archive_session(id)
     }
 
+    /// Wipe all chats + cached sources + sessions (the in-app "Clear data").
+    /// Leaves a single fresh session so the UI always has somewhere to write.
+    pub fn clear_all_data(&self) -> Result<i64> {
+        self.db.clear_all_data()?;
+        let s = self.db.create_session("Session 1")?;
+        Ok(s.id)
+    }
+
     /// Direct engine call for the currency converter / chart panels (no network,
     /// no persistence) — reuses the planner exactly as chat does.
     pub fn quick_answer(&self, text: &str) -> String {
         let slots = self.classifier.classify(text);
         self.planner.plan_and_answer(&slots, text)
+    }
+
+    /// Currency conversion: live rate (frankfurter.app / ECB, cached 1h) when
+    /// the network is on, falling back to the deterministic local matrix.
+    /// Runs on a worker thread (the live fetch may block briefly).
+    pub fn convert_live_or_local(&self, amount_raw: &str, from: &str, to: &str) -> String {
+        let from = from.to_uppercase();
+        let to = to.to_uppercase();
+        let amount: f64 = amount_raw.trim().parse().unwrap_or(0.0);
+
+        if amount > 0.0 && from != to && self.use_network.load(Ordering::Relaxed) {
+            if let Some(fx) = self.fresh_fx() {
+                let fu = fx.per_usd.get(&from).copied();
+                let tu = fx.per_usd.get(&to).copied();
+                if let (Some(fu), Some(tu)) = (fu, tu) {
+                    let result = amount / fu * tu;
+                    let rate = tu / fu;
+                    self.persist_source(&fx.source_url, &fx.sha256, fx.retrieved_at);
+                    return format!(
+                        "# Currency Conversion\n\n**{:.2} {} ≈ {:.2} {}**\n\n\
+                         - Live rate: 1 {} = {:.4} {}\n\
+                         - Source: frankfurter.app (ECB reference rates)\n\
+                         - Fetched: {} UTC\n\n\
+                         _Rates are reference rates updated daily; provenance saved. \
+                         Turn off **Live network** to use the built-in approximate matrix._",
+                        amount, from, result, to, from, rate, to,
+                        fx.retrieved_at.format("%Y-%m-%d %H:%M")
+                    );
+                }
+            }
+        }
+
+        // Fallback: deterministic local matrix (no network, always available).
+        self.quick_answer(&format!("convert {} {} to {}", amount_raw, from, to))
+    }
+
+    /// Return cached live FX rates if fresh (TTL 1h), else fetch and cache.
+    /// Returns None if the fetch fails (caller falls back to local rates).
+    fn fresh_fx(&self) -> Option<crate::retrieval::FxRates> {
+        const TTL: Duration = Duration::from_secs(3600);
+        let mut guard = self.fx_cache.lock().ok()?;
+        if let Some((t, fx)) = guard.as_ref() {
+            if t.elapsed() < TTL {
+                return Some(fx.clone());
+            }
+        }
+        let fx = self.retriever.fetch_fx_rates().ok()?;
+        *guard = Some((Instant::now(), fx.clone()));
+        Some(fx)
     }
 
     /// Record a live source in the provenance table (audit trail).

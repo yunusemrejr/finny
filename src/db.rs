@@ -152,7 +152,7 @@ impl Db {
         let c = rusqlite::Connection::open(&self.path)?;
         c.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
         let mut stmt = c.prepare(
-            "SELECT id, ts, role, text, session_id, intent, query_plan FROM messages WHERE session_id = ?1 ORDER BY ts",
+            "SELECT id, ts, role, text, session_id, intent, query_plan FROM messages WHERE session_id = ?1 ORDER BY ts, id",
         )?;
         let rows = stmt
             .query_map([sid], |row| {
@@ -188,6 +188,19 @@ impl Db {
         if let Some(id) = id {
             c.execute("UPDATE sessions SET is_archived = 1 WHERE id = ?1", [id])?;
         }
+        Ok(())
+    }
+
+    /// Wipe all user-generated data: every chat message, every cached live
+    /// source, and every session. The schema (tables) is preserved and at least
+    /// one fresh session is guaranteed to exist afterwards (via `list_sessions`).
+    /// This is the "Clear data" action — it never deletes the database file.
+    pub fn clear_all_data(&self) -> Result<()> {
+        let c = rusqlite::Connection::open(&self.path)?;
+        c.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+        c.execute_batch(
+            "DELETE FROM messages; DELETE FROM sources; DELETE FROM sessions;",
+        )?;
         Ok(())
     }
 }

@@ -5,7 +5,11 @@ use sha2::{Digest, Sha256};
 use std::time::Duration;
 
 pub struct Retriever {
+    /// Slower client (12s) for HTML page scrapes, which can be large/slow.
     client: blocking::Client,
+    /// Fast client (4s) for small JSON APIs — keeps live lookups snappy and
+    /// bounded so the UI never waits long (calls run off-thread regardless).
+    api: blocking::Client,
 }
 
 pub struct RetrievedPage {
@@ -23,13 +27,27 @@ pub struct LiveData {
     pub text: String,
 }
 
+/// Live FX rate snapshot: units of each currency per 1 USD (USD = 1.0).
+#[derive(Clone, Debug)]
+pub struct FxRates {
+    pub per_usd: std::collections::HashMap<String, f64>,
+    pub source_url: String,
+    pub sha256: String,
+    pub retrieved_at: chrono::DateTime<chrono::Utc>,
+}
+
 impl Retriever {
     pub fn new(timeout_secs: u64) -> Result<Self> {
-        let client = blocking::Client::builder()
-            .timeout(Duration::from_secs(timeout_secs))
-            .user_agent("Finny/0.1 (local finance assistant)")
-            .build()?;
-        Ok(Self { client })
+        let mk = |secs: u64| -> Result<blocking::Client> {
+            Ok(blocking::Client::builder()
+                .timeout(Duration::from_secs(secs))
+                .user_agent("Finny/0.1 (local finance assistant)")
+                .build()?)
+        };
+        Ok(Self {
+            client: mk(timeout_secs)?,
+            api: mk(timeout_secs.min(4))?,
+        })
     }
 
     pub fn is_safe(url: &str) -> bool {
@@ -61,21 +79,14 @@ impl Retriever {
         true
     }
 
-    /// Low-level fetch with SSRF guard — returns raw body text.
+    /// Low-level fetch with SSRF guard — returns raw body text (HTML client).
     fn fetch_raw(&self, url: &str) -> Result<String> {
-        if !Self::is_safe(url) {
-            return Err(anyhow::anyhow!("URL blocked by retrieval policy: {}", url));
-        }
-        let resp = self
-            .client
-            .get(url)
-            .send()
-            .map_err(|e| anyhow::anyhow!(format!("request failed: {e}")))?;
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(anyhow::anyhow!("HTTP {status} for {url}"));
-        }
-        Ok(resp.text().unwrap_or_default())
+        fetch_with(&self.client, url)
+    }
+
+    /// Low-level fetch with SSRF guard using the fast API client.
+    fn fetch_api(&self, url: &str) -> Result<String> {
+        fetch_with(&self.api, url)
     }
 
     pub fn fetch(&self, url: &str) -> Result<RetrievedPage> {
@@ -98,7 +109,7 @@ impl Retriever {
             "https://api.worldbank.org/v2/country/{}/indicator/{}?format=json&date=2020:2025&per_page=10",
             country_code, indicator
         );
-        let body = self.fetch_raw(&url)?;
+        let body = self.fetch_api(&url)?;
         let text = format_worldbank_response(&body)?;
         let mut hasher = Sha256::new();
         hasher.update(&body);
@@ -116,7 +127,7 @@ impl Retriever {
             "https://api.bls.gov/publicAPI/v2/timeseries/data/{}?latest=6",
             series_id
         );
-        let body = self.fetch_raw(&url)?;
+        let body = self.fetch_api(&url)?;
         let text = format_bls_response(&body)?;
         let mut hasher = Sha256::new();
         hasher.update(&body);
@@ -127,6 +138,61 @@ impl Retriever {
             text,
         })
     }
+
+    /// Fetch live FX rates vs USD from the keyless frankfurter.app API
+    /// (sourced from the European Central Bank reference rates). No API key.
+    /// Returns a map of currency code → units per 1 USD (USD = 1.0).
+    pub fn fetch_fx_rates(&self) -> Result<FxRates> {
+        let url = "https://api.frankfurter.app/latest?from=USD";
+        let body = self.fetch_api(url)?;
+        let mut hasher = Sha256::new();
+        hasher.update(&body);
+        let rates = parse_fx_rates(&body)?;
+        Ok(FxRates {
+            per_usd: rates,
+            source_url: url.to_string(),
+            sha256: format!("{:x}", hasher.finalize()),
+            retrieved_at: chrono::Utc::now(),
+        })
+    }
+}
+
+/// Low-level GET with the SSRF guard, using the given client.
+fn fetch_with(client: &blocking::Client, url: &str) -> Result<String> {
+    if !Retriever::is_safe(url) {
+        return Err(anyhow::anyhow!("URL blocked by retrieval policy: {}", url));
+    }
+    let resp = client
+        .get(url)
+        .send()
+        .map_err(|e| anyhow::anyhow!(format!("request failed: {e}")))?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(anyhow::anyhow!("HTTP {status} for {url}"));
+    }
+    Ok(resp.text().unwrap_or_default())
+}
+
+/// Parse a frankfurter.app `{"base":"USD","rates":{...}}` body into a per-USD map.
+fn parse_fx_rates(body: &str) -> Result<std::collections::HashMap<String, f64>> {
+    let data: Value = serde_json::from_str(body)?;
+    let rates_obj = data
+        .get("rates")
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| anyhow::anyhow!("unexpected FX response shape"))?;
+    let mut map = std::collections::HashMap::new();
+    map.insert("USD".to_string(), 1.0);
+    for (code, val) in rates_obj {
+        if let Some(n) = val.as_f64() {
+            if n > 0.0 {
+                map.insert(code.to_uppercase(), n);
+            }
+        }
+    }
+    if map.len() < 2 {
+        return Err(anyhow::anyhow!("FX response had no usable rates"));
+    }
+    Ok(map)
 }
 
 /// Convert an HTML string to plain text by stripping tags.
@@ -352,6 +418,38 @@ mod tests {
         assert!(Retriever::is_safe(
             "https://api.bls.gov/publicAPI/v2/timeseries/data/CUUR0000SA0"
         ));
+    }
+
+    #[test]
+    fn fx_json_format() {
+        let json = r#"{"amount":1.0,"base":"USD","date":"2025-01-01","rates":{"EUR":0.92,"JPY":155.0,"GBP":0.79}}"#;
+        let m = parse_fx_rates(json).unwrap();
+        assert_eq!(m.get("USD"), Some(&1.0));
+        assert_eq!(m.get("EUR"), Some(&0.92));
+        assert_eq!(m.get("JPY"), Some(&155.0));
+    }
+
+    #[test]
+    fn fx_blocks_bad_json() {
+        assert!(parse_fx_rates(r#"{"foo":"bar"}"#).is_err());
+        assert!(parse_fx_rates(r#"{"rates":{}}"#).is_err());
+    }
+
+    #[test]
+    fn fx_api_is_safe() {
+        assert!(Retriever::is_safe("https://api.frankfurter.app/latest?from=USD"));
+    }
+
+    #[test]
+    #[ignore]
+    fn live_fx_fetch() {
+        if std::env::var("FINNY_LIVE_TEST").is_err() {
+            return;
+        }
+        let r = Retriever::new(6).unwrap();
+        let fx = r.fetch_fx_rates().unwrap();
+        assert!(fx.per_usd.contains_key("EUR"));
+        println!("Live FX ({} rates): EUR={:?}", fx.per_usd.len(), fx.per_usd.get("EUR"));
     }
 
     // --- Live network integration tests (ignored by default) ---

@@ -40,10 +40,27 @@ fn main() -> eframe::Result<()> {
 
     let logo = load_logo();
 
+    // Optional initial window size, e.g. FINNY_INITIAL_SIZE=900x700. Handy on
+    // small laptops and for headless capture; clamped to the minimums below.
+    // Any unparseable value falls back to the default 1200x880.
+    let (init_w, init_h) = std::env::var("FINNY_INITIAL_SIZE")
+        .ok()
+        .and_then(|s| {
+            let (a, b) = s.split_once(['x', 'X', ','].as_ref())?;
+            let w = a.trim().parse::<f32>().ok()?;
+            let h = b.trim().parse::<f32>().ok()?;
+            Some((w.max(440.0), h.max(520.0)))
+        })
+        .unwrap_or((1200.0, 880.0));
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1200.0, 880.0])
-            .with_min_inner_size([960.0, 680.0])
+            .with_inner_size([init_w, init_h])
+            .with_min_inner_size([440.0, 520.0])
+            // Open at the requested size, not auto-maximized — otherwise the
+            // window fills the screen and the responsive (compact) layout can
+            // never be seen. The user can still maximize via the title bar.
+            .with_maximized(false)
             .with_title("Finny — Finance Assistant"),
         ..Default::default()
     };
@@ -92,6 +109,7 @@ enum Tab {
 /// Message from worker thread back to UI.
 enum WorkerMsg {
     Chat(Result<ChatReply, String>),
+    Fx(String),
 }
 
 struct FinnyApp {
@@ -120,6 +138,7 @@ struct FinnyApp {
     conv_from: usize,
     conv_to: usize,
     conv_result: String,
+    conv_busy: bool,
 
     // chart state
     chart_metric: usize,
@@ -130,6 +149,7 @@ struct FinnyApp {
     // settings
     text_scale: f32,
     export_status: String,
+    confirm_clear: bool,
 
     // selftest
     selftest: bool,
@@ -166,12 +186,14 @@ impl FinnyApp {
             conv_from: 0,
             conv_to: 1,
             conv_result: String::new(),
+            conv_busy: false,
             chart_metric: 0,
             chart_region: 0,
             chart_output: String::new(),
             chart_initialized: false,
             text_scale: 1.35,
             export_status: String::new(),
+            confirm_clear: false,
             selftest,
             frame_count: 0,
         }
@@ -246,16 +268,35 @@ impl FinnyApp {
                         }
                     }
                 }
+                WorkerMsg::Fx(text) => {
+                    self.conv_busy = false;
+                    self.conv_result = text;
+                }
             }
         }
     }
 
     fn run_converter(&mut self) {
-        let amount = self.conv_amount.trim();
+        if self.conv_busy {
+            return;
+        }
+        let amount = self.conv_amount.trim().to_string();
+        if amount.is_empty() {
+            return;
+        }
         let from = CURRENCIES[self.conv_from];
         let to = CURRENCIES[self.conv_to];
-        let q = format!("convert {} {} to {}", amount, from, to);
-        self.conv_result = self.engine.quick_answer(&q);
+        self.conv_busy = true;
+        self.conv_result = "Fetching live rate…".into();
+        let engine = self.engine.clone();
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                engine.convert_live_or_local(&amount, from, to)
+            }))
+            .unwrap_or_else(|_| "[error] conversion failed".into());
+            let _ = tx.send(WorkerMsg::Fx(out));
+        });
     }
 
     fn run_chart(&mut self) {
@@ -290,7 +331,7 @@ impl FinnyApp {
             out.push_str(&format!(
                 "**{}** ({}):\n\n{}\n\n---\n\n",
                 who,
-                m.ts.format("%Y-%m-%d %H:%M"),
+                m.ts.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M"),
                 m.text
             ));
         }
@@ -315,7 +356,7 @@ impl eframe::App for FinnyApp {
         self.drain_worker();
 
         // Keep repainting while a request is in flight so results appear promptly.
-        if self.thinking {
+        if self.thinking || self.conv_busy {
             ctx.request_repaint_after(std::time::Duration::from_millis(80));
         }
 
@@ -353,33 +394,36 @@ impl FinnyApp {
                     .inner_margin(egui::Margin::symmetric(14.0, 10.0)),
             )
             .show(ctx, |ui| {
+                let compact = ctx.screen_rect().width() < 720.0;
                 ui.horizontal(|ui| {
                     if let Some(tex) = &self.logo_tex {
                         let [w, h] = tex.size();
-                        let target_h: f32 = 96.0;
+                        let target_h: f32 = if compact { 44.0 } else { 96.0 };
                         let scale = target_h / h as f32;
                         let size = egui::vec2(w as f32 * scale, target_h);
                         ui.add(egui::Image::new(tex).fit_to_exact_size(size));
                     } else {
                         ui.heading(
-                            egui::RichText::new("FINNY").size(48.0).color(egui::Color32::WHITE),
+                            egui::RichText::new("FINNY").size(if compact { 28.0 } else { 48.0 }).color(egui::Color32::WHITE),
                         );
                     }
                     ui.add_space(12.0);
                     ui.vertical(|ui| {
-                        ui.add_space(16.0);
+                        ui.add_space(if compact { 4.0 } else { 16.0 });
                         ui.label(
                             egui::RichText::new("Local Finance Assistant")
-                                .size(20.0)
+                                .size(if compact { 15.0 } else { 20.0 })
                                 .strong()
                                 .color(egui::Color32::WHITE),
                         );
-                        ui.label(
-                            egui::RichText::new("native desktop · no cloud · no LLM")
-                                .size(14.0)
-                                .italics()
-                                .color(egui::Color32::from_rgb(220, 245, 245)),
-                        );
+                        if !compact {
+                            ui.label(
+                                egui::RichText::new("native desktop · no cloud · no LLM")
+                                    .size(14.0)
+                                    .italics()
+                                    .color(egui::Color32::from_rgb(220, 245, 245)),
+                            );
+                        }
                     });
                 });
             });
@@ -441,99 +485,161 @@ impl FinnyApp {
     }
 
     fn render_side_panel(&mut self, ctx: &egui::Context) {
-        egui::SidePanel::left("sessions")
-            .resizable(true)
-            .default_width(260.0)
-            .frame(
-                egui::Frame::default()
-                    .fill(egui::Color32::from_rgb(232, 228, 220))
-                    .inner_margin(egui::Margin::same(8.0)),
-            )
-            .show(ctx, |ui| {
-                // Tab bar
-                ui.horizontal(|ui| {
-                    ui.selectable_value(&mut self.tab, Tab::Chat, "  Chat  ");
-                    ui.selectable_value(&mut self.tab, Tab::Converter, "  FX  ");
-                    ui.selectable_value(&mut self.tab, Tab::Charts, " Charts ");
+        // Browser-like reflow: on a narrow window the left sidebar collapses
+        // into a top navigation strip so the chat/content gets full width.
+        let compact = ctx.screen_rect().width() < 720.0;
+        let panel_fill = egui::Color32::from_rgb(232, 228, 220);
+        if compact {
+            egui::TopBottomPanel::top("nav_compact")
+                .frame(
+                    egui::Frame::default()
+                        .fill(panel_fill)
+                        .inner_margin(egui::Margin::same(6.0)),
+                )
+                .show(ctx, |ui| {
+                    self.render_tab_bar(ui);
+                    ui.horizontal(|ui| {
+                        self.render_network_row(ui);
+                        ui.separator();
+                        ui.collapsing("Sessions & Settings", |ui| {
+                            self.render_sessions(ui);
+                            ui.add_space(4.0);
+                            ui.separator();
+                            self.render_settings(ui);
+                        });
+                    });
                 });
-                ui.add_space(4.0);
-                ui.separator();
-                ui.add_space(4.0);
+        } else {
+            egui::SidePanel::left("sessions")
+                .resizable(true)
+                .default_width(260.0)
+                .frame(
+                    egui::Frame::default()
+                        .fill(panel_fill)
+                        .inner_margin(egui::Margin::same(8.0)),
+                )
+                .show(ctx, |ui| {
+                    self.render_tab_bar(ui);
+                    ui.add_space(4.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+                    self.render_network_row(ui);
+                    ui.add_space(4.0);
+                    ui.separator();
+                    self.render_sessions(ui);
+                    ui.add_space(4.0);
+                    ui.separator();
+                    ui.collapsing("Settings", |ui| self.render_settings(ui));
+                });
+        }
+    }
 
-                // Network toggle
-                let mut net = self.engine.network_on();
-                if ui.checkbox(&mut net, "Live network").changed() {
-                    self.engine.set_network(net);
+    fn render_tab_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.tab, Tab::Chat, "  Chat  ");
+            ui.selectable_value(&mut self.tab, Tab::Converter, "  FX  ");
+            ui.selectable_value(&mut self.tab, Tab::Charts, " Charts ");
+        });
+    }
+
+    fn render_network_row(&mut self, ui: &mut egui::Ui) {
+        let mut net = self.engine.network_on();
+        if ui.checkbox(&mut net, "Live network").changed() {
+            self.engine.set_network(net);
+        }
+    }
+
+    fn render_sessions(&mut self, ui: &mut egui::Ui) {
+        ui.strong("Sessions");
+        ui.add_space(2.0);
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.new_session_title)
+                    .hint_text("new title…")
+                    .desired_width(150.0),
+            );
+            if ui.button(" + ").clicked() {
+                let title = if self.new_session_title.trim().is_empty() {
+                    format!("Session {}", self.sessions.len() + 1)
+                } else {
+                    self.new_session_title.trim().to_string()
+                };
+                if let Ok(s) = self.engine.create_session(&title) {
+                    self.current_session = Some(s.id);
+                    self.new_session_title.clear();
+                    self.reload_sessions();
+                    self.reload_chat();
                 }
-                ui.add_space(4.0);
-                ui.separator();
+            }
+        });
+        ui.add_space(4.0);
 
-                // Sessions
-                ui.strong("Sessions");
-                ui.add_space(2.0);
-                ui.horizontal(|ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.new_session_title)
-                            .hint_text("new title…")
-                            .desired_width(150.0),
-                    );
-                    if ui.button(" + ").clicked() {
-                        let title = if self.new_session_title.trim().is_empty() {
-                            format!("Session {}", self.sessions.len() + 1)
-                        } else {
-                            self.new_session_title.trim().to_string()
-                        };
-                        if let Ok(s) = self.engine.create_session(&title) {
-                            self.current_session = Some(s.id);
-                            self.new_session_title.clear();
+        egui::ScrollArea::vertical()
+            .max_height(320.0)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                let ids: Vec<(i64, String)> =
+                    self.sessions.iter().map(|s| (s.id, s.title.clone())).collect();
+                for (id, title) in ids {
+                    ui.horizontal(|ui| {
+                        let selected = Some(id) == self.current_session;
+                        if ui.selectable_label(selected, &title).clicked() {
+                            self.current_session = Some(id);
+                            self.reload_chat();
+                            self.scroll_to_bottom = true;
+                        }
+                        ui.add_space(4.0);
+                        if ui.small_button("✕").clicked() {
+                            let _ = self.engine.archive_session(Some(id));
+                            if self.current_session == Some(id) {
+                                self.current_session = None;
+                            }
                             self.reload_sessions();
                             self.reload_chat();
                         }
-                    }
-                });
-                ui.add_space(4.0);
-
-                egui::ScrollArea::vertical()
-                    .max_height(320.0)
-                    .show(ui, |ui| {
-                        let ids: Vec<(i64, String)> =
-                            self.sessions.iter().map(|s| (s.id, s.title.clone())).collect();
-                        for (id, title) in ids {
-                            ui.horizontal(|ui| {
-                                let selected = Some(id) == self.current_session;
-                                if ui.selectable_label(selected, &title).clicked() {
-                                    self.current_session = Some(id);
-                                    self.reload_chat();
-                                    self.scroll_to_bottom = true;
-                                }
-                                ui.add_space(4.0);
-                                if ui.small_button("✕").clicked() {
-                                    let _ = self.engine.archive_session(Some(id));
-                                    if self.current_session == Some(id) {
-                                        self.current_session = None;
-                                    }
-                                    self.reload_sessions();
-                                    self.reload_chat();
-                                }
-                            });
-                        }
                     });
-
-                ui.add_space(4.0);
-                ui.separator();
-                ui.collapsing("Settings", |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("Text scale").size(14.0));
-                        ui.add(egui::Slider::new(&mut self.text_scale, 0.8..=2.0));
-                    });
-                    if ui.button("Export chat → .md").clicked() {
-                        self.export_history();
-                    }
-                    if !self.export_status.is_empty() {
-                        ui.label(egui::RichText::new(self.export_status.clone()).size(13.0));
-                    }
-                });
+                }
             });
+    }
+
+    fn render_settings(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Text scale").size(14.0));
+            ui.add(egui::Slider::new(&mut self.text_scale, 0.8..=2.0));
+        });
+        ui.horizontal(|ui| {
+            if ui.button("Export chat → .md").clicked() {
+                self.export_history();
+            }
+            // Two-step destructive action: first click arms, second confirms.
+            let label = if self.confirm_clear { "Confirm clear?" } else { "Clear all data" };
+            let armed = self.confirm_clear;
+            if ui
+                .add_enabled(true, egui::Button::new(egui::RichText::new(label).color(
+                    if armed { egui::Color32::from_rgb(150, 0, 0) } else { egui::Color32::from_gray(20) },
+                )))
+                .clicked()
+            {
+                if armed {
+                    if let Ok(new_id) = self.engine.clear_all_data() {
+                        self.current_session = Some(new_id);
+                        self.reload_sessions();
+                        self.reload_chat();
+                        self.last_sources.clear();
+                        self.export_status = "All chats & cached data cleared.".into();
+                    }
+                    self.confirm_clear = false;
+                } else {
+                    self.confirm_clear = true;
+                }
+            }
+            if armed && ui.small_button("cancel").clicked() {
+                self.confirm_clear = false;
+            }
+        });
+        if !self.export_status.is_empty() {
+            ui.label(egui::RichText::new(self.export_status.clone()).size(13.0));
+        }
     }
 
     fn render_central(&mut self, ctx: &egui::Context) {
@@ -598,46 +704,74 @@ impl FinnyApp {
             .inner_margin(egui::Margin::same(6.0))
             .rounding(egui::Rounding::same(3.0))
             .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("You:")
-                            .strong()
-                            .size(14.0)
-                            .color(egui::Color32::from_rgb(30, 50, 110)),
-                    );
-                    let resp = ui.add(
-                        egui::TextEdit::multiline(&mut self.input)
-                            .hint_text("Ask Finny…  (Enter = new line · Ctrl/Cmd+Enter = send)")
-                            .desired_rows(2)
-                            .desired_width(ui.available_width() - 70.0),
-                    );
-                    let mut send_now = false;
-                    // Send only on Ctrl/Cmd+Enter (or the Ask button). A plain Enter
-                    // falls through to the multiline editor and inserts a newline,
-                    // which matches the hint and lets users type multi-line questions.
-                    // The previous plain-Enter branch sent on every Return, so a user
-                    // following the hint (pressing Enter for a newline) sent the
-                    // message prematurely.
-                    if resp.has_focus()
-                        && ui.input(|i| {
-                            i.key_pressed(egui::Key::Enter) && i.modifiers.command
+                let compact = ui.ctx().screen_rect().width() < 720.0;
+                let hint = "Ask Finny…  (Enter = new line · Ctrl/Cmd+Enter = send)";
+                let you_label = || {
+                    egui::RichText::new("You:")
+                        .strong()
+                        .size(14.0)
+                        .color(egui::Color32::from_rgb(30, 50, 110))
+                };
+                let mut send_now = false;
+
+                // Build the editor (+ button) and capture its Response so we can
+                // detect Ctrl/Cmd+Enter. Layout differs by width, but the send
+                // logic is shared below.
+                let resp = if compact {
+                    let r = ui
+                        .horizontal(|ui| {
+                            ui.label(you_label());
+                            ui.add(
+                                egui::TextEdit::multiline(&mut self.input)
+                                    .hint_text(hint)
+                                    .desired_rows(2)
+                                    .desired_width((ui.available_width() - 44.0).max(80.0)),
+                            )
                         })
-                    {
-                        send_now = true;
-                    }
-                    if ui
-                        .add_enabled(!self.thinking, egui::Button::new("  Ask  "))
-                        .clicked()
-                    {
-                        send_now = true;
-                    }
-                    if send_now {
-                        // Ctrl+Enter makes the multiline editor drop a stray newline
-                        // at the cursor; trim trailing whitespace before sending.
-                        self.input = self.input.trim_end().to_string();
-                        self.send_chat();
-                    }
-                });
+                        .inner;
+                    ui.horizontal(|ui| {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .add_enabled(!self.thinking, egui::Button::new(" Ask "))
+                                .clicked()
+                            {
+                                send_now = true;
+                            }
+                        });
+                    });
+                    r
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.label(you_label());
+                        let r = ui.add(
+                            egui::TextEdit::multiline(&mut self.input)
+                                .hint_text(hint)
+                                .desired_rows(2)
+                                .desired_width((ui.available_width() - 70.0).max(80.0)),
+                        );
+                        if ui
+                            .add_enabled(!self.thinking, egui::Button::new("  Ask  "))
+                            .clicked()
+                        {
+                            send_now = true;
+                        }
+                        r
+                    })
+                    .inner
+                };
+
+                // Send only on Ctrl/Cmd+Enter (or the Ask button). A plain Enter
+                // falls through to the multiline editor and inserts a newline,
+                // matching the hint so users can type multi-line questions.
+                if resp.has_focus()
+                    && ui.input(|i| i.key_pressed(egui::Key::Enter) && i.modifiers.command)
+                {
+                    send_now = true;
+                }
+                if send_now {
+                    self.input = self.input.trim_end().to_string();
+                    self.send_chat();
+                }
             });
     }
 
@@ -664,7 +798,13 @@ impl FinnyApp {
                 ui.horizontal(|ui| {
                     ui.colored_label(color, egui::RichText::new(who).strong().size(14.0));
                     ui.label(
-                        egui::RichText::new(m.ts.format("%H:%M").to_string())
+                        // Timestamps are stored in UTC; show them in the user's
+                        // local zone so they agree with the status-bar clock.
+                        egui::RichText::new(
+                            m.ts.with_timezone(&chrono::Local)
+                                .format("%H:%M")
+                                .to_string(),
+                        )
                             .size(11.0)
                             .color(egui::Color32::from_gray(80)),
                     );
@@ -715,16 +855,29 @@ impl FinnyApp {
                         });
                 });
                 ui.add_space(8.0);
-                if ui.button("  Convert  ").clicked() {
-                    self.run_converter();
-                }
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(!self.conv_busy, egui::Button::new("  Convert  "))
+                        .clicked()
+                    {
+                        self.run_converter();
+                    }
+                    if self.conv_busy {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(140, 65, 0),
+                            egui::RichText::new("●●● fetching live rate").italics().size(13.0),
+                        );
+                    }
+                });
             });
 
         ui.add_space(8.0);
         ui.separator();
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            render_markdown(ui, &self.conv_result);
-        });
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                render_markdown(ui, &self.conv_result);
+            });
     }
 
     fn render_charts(&mut self, ui: &mut egui::Ui) {
@@ -786,6 +939,12 @@ impl FinnyApp {
 fn render_markdown(ui: &mut egui::Ui, text: &str) {
     let mut in_code_block = false;
     let mut code_buf = String::new();
+    // Each fenced code block gets its own ScrollArea id. A single hard-coded
+    // id (the previous behaviour) made every code block in a frame share one
+    // egui widget id, so two+ blocks (e.g. a comparison chart and a trend
+    // chart in the same log) collided and the layout never settled — visible
+    // as a flicker/"loop". A per-block counter keeps ids unique.
+    let mut code_idx: u32 = 0;
 
     for line in text.lines() {
         let trimmed = line.trim();
@@ -803,7 +962,7 @@ fn render_markdown(ui: &mut egui::Ui, text: &str) {
                     .rounding(egui::Rounding::same(3.0))
                     .show(ui, |ui| {
                         egui::ScrollArea::horizontal()
-                            .id_source("code_scroll")
+                            .id_source(format!("code_scroll_{code_idx}"))
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
                                 ui.add(
@@ -819,6 +978,7 @@ fn render_markdown(ui: &mut egui::Ui, text: &str) {
                     });
                 in_code_block = false;
                 code_buf.clear();
+                code_idx += 1;
             } else {
                 in_code_block = true;
             }
@@ -1037,7 +1197,25 @@ fn apply_retro_style(ctx: &egui::Context) {
     // Classic gray beveled desktop look (Windows 2000 / Java Swing)
     v.window_fill = egui::Color32::from_rgb(240, 236, 228);
     v.panel_fill = egui::Color32::from_rgb(240, 236, 228);
-    v.override_text_color = Some(egui::Color32::from_gray(20));
+    // Dark, high-contrast text on the light panels.
+    let ink = egui::Color32::from_gray(20);
+    v.override_text_color = Some(ink);
+
+    // A widget's text colour is its per-state `fg_stroke.color` (and strong text
+    // uses `widgets.active.fg_stroke`). The cloned base style left these at the
+    // dark-theme defaults (light/medium gray), which rendered as washed-out text
+    // on our light panels — measured ~0.86 and ~0.55 luminance glyphs on a 0.91
+    // panel. Force every interactive state's foreground dark. (The white-on-teal
+    // header is unaffected: it sets its colour explicitly via RichText.)
+    for w in [
+        &mut v.widgets.noninteractive,
+        &mut v.widgets.inactive,
+        &mut v.widgets.hovered,
+        &mut v.widgets.active,
+        &mut v.widgets.open,
+    ] {
+        w.fg_stroke.color = ink;
+    }
 
     // Widget bevels
     v.widgets.inactive.bg_fill = egui::Color32::from_rgb(220, 216, 208);
@@ -1058,9 +1236,12 @@ fn apply_retro_style(ctx: &egui::Context) {
     v.faint_bg_color = egui::Color32::from_gray(224);
     v.extreme_bg_color = egui::Color32::from_gray(248);
 
-    // Selection color (classic teal)
-    v.selection.bg_fill = egui::Color32::from_rgb(0, 120, 140);
-    v.selection.stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(0, 80, 100));
+    // Selection highlight. Because some widget paths draw the *selected* text
+    // with the active/open foreground (now dark) and others with selection.stroke
+    // (also dark below), the highlight MUST be light so selected text stays
+    // readable. A pale teal keeps the retro feel and a clear selected state.
+    v.selection.bg_fill = egui::Color32::from_rgb(176, 210, 214);
+    v.selection.stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(0, 90, 110));
 
     // Hyperlink color — must pass WCAG AA on light background
     v.hyperlink_color = egui::Color32::from_rgb(0, 100, 120);
