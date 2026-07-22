@@ -27,6 +27,24 @@ pub enum IntentClass {
     Trend,
     Forecast,
     UnsupportedRequest,
+    /// A purely social message (greeting, thanks, help, …) handled by the
+    /// dialogue layer — detected by the local ML classifier in `nlu.rs`,
+    /// which the rule-based classifier below cannot do.
+    Chitchat(ChitchatKind),
+}
+
+/// Kinds of small-talk / social message Finny responds to conversationally.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChitchatKind {
+    Greeting,
+    Farewell,
+    Thanks,
+    HowAreYou,
+    Capabilities,
+    Identity,
+    Affirm,
+    Negate,
+    Smalltalk,
 }
 
 #[derive(Clone, Debug)]
@@ -89,6 +107,7 @@ impl IntentClass {
             IntentClass::Trend => "trend",
             IntentClass::Forecast => "forecast",
             IntentClass::UnsupportedRequest => "unsupported_request",
+            IntentClass::Chitchat(_) => "chitchat",
         }
     }
 }
@@ -108,7 +127,7 @@ impl Default for IntentClassifier {
 // a value it recognises.
 // ---------------------------------------------------------------------------
 
-const SUBJECT_ALIASES: &[(&str, &[&str])] = &[
+pub(crate) const SUBJECT_ALIASES: &[(&str, &[&str])] = &[
     // --- Rates (check before generic "rate") ---
     (
         "policy rate",
@@ -182,7 +201,7 @@ const SUBJECT_ALIASES: &[(&str, &[&str])] = &[
     ("dividend", &["dividend", "dividends", "payout", "distribution"]),
 ];
 
-const GEO_ALIASES: &[(&str, &[&str])] = &[
+pub(crate) const GEO_ALIASES: &[(&str, &[&str])] = &[
     // --- Multi-word first to avoid partial matches ---
     // NOTE: longer / more-specific entries MUST come before short codes
     // like "us", "eu", "uk" so that "deutschland" does not match "eu".

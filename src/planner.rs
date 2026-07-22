@@ -18,6 +18,9 @@ impl QueryPlanner {
             IntentClass::Trend => self.trend(slots, question),
             IntentClass::Forecast => self.forecast(slots, question),
             IntentClass::UnsupportedRequest => self.unsupported(question),
+            // Chitchat is handled by the dialogue layer in engine.rs before the
+            // planner is ever consulted; this arm is a defensive fallback only.
+            IntentClass::Chitchat(_) => String::new(),
         }
     }
     fn direct_lookup(&self, s: &SlotBindings) -> String {

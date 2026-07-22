@@ -3,8 +3,10 @@
 // The finance engine (intent/planner/db/retrieval) is reused verbatim via engine.rs.
 
 mod db;
+mod dialogue;
 mod engine;
 mod intent;
+mod nlu;
 mod planner;
 mod retrieval;
 

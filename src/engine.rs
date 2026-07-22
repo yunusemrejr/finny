@@ -23,6 +23,7 @@ pub struct Engine {
     pub db: Db,
     pub retriever: Arc<Retriever>,
     pub classifier: IntentClassifier,
+    pub nlu: crate::nlu::Nlu,
     pub planner: QueryPlanner,
     pub use_network: Arc<AtomicBool>,
 }
@@ -35,6 +36,7 @@ impl Engine {
             db,
             retriever: Arc::new(Retriever::new(12)?),
             classifier: IntentClassifier::new(),
+            nlu: crate::nlu::Nlu::new(),
             planner: QueryPlanner::new(),
             use_network: Arc::new(AtomicBool::new(network_enabled)),
         })
@@ -43,9 +45,21 @@ impl Engine {
     /// Full chat pipeline — preserved verbatim from app.rs::handle_chat, minus
     /// the serde_json envelope. Runs on a worker thread (may block on network).
     pub fn handle_chat(&self, text: &str, session_id: Option<i64>) -> ChatReply {
-        let slots = self.classifier.classify(text);
-        let mut answer = self.planner.plan_and_answer(&slots, text);
+        let slots = self.nlu.resolve(text);
         let mut sources: Vec<String> = Vec::new();
+
+        // Chitchat is answered conversationally by the dialogue layer — no
+        // planner and no network round-trips. Finance queries get the
+        // deterministic answer (optionally augmented with live data below),
+        // then wrapped into a conversational reply.
+        let chitchat_kind = match &slots.intent {
+            crate::intent::IntentClass::Chitchat(kind) => Some(*kind),
+            _ => None,
+        };
+        let mut answer = match chitchat_kind {
+            Some(kind) => crate::dialogue::chitchat_reply(kind, text),
+            None => self.planner.plan_and_answer(&slots, text),
+        };
 
         // Network-augmented intents: anything that asks for current or
         // historical data can benefit from live sources.
@@ -135,6 +149,12 @@ impl Engine {
                     }
                 }
             }
+        }
+
+        // Make the deterministic finance answer conversational. Chitchat is
+        // already conversational and skips this wrapping.
+        if chitchat_kind.is_none() {
+            answer = crate::dialogue::wrap(&slots, &answer, text);
         }
 
         let effective_session = match session_id {
@@ -369,5 +389,79 @@ impl Engine {
             // GDP (BLS does not have GDP, fall through)
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod conversational_tests {
+    //! End-to-end regression tests for the user's #1 complaint: chat used to
+    //! return rigid boilerplate ("# Answer — subject ((region)) / Not in local
+    //! cache") even for greetings. These run the FULL handle_chat pipeline
+    //! (classify → plan → dialogue) against a throwaway DB with network OFF
+    //! (fast + deterministic) and assert the replies are now conversational.
+    //!
+    //! One sequential test (not parallel) so the process-global FINNY_DATA_DIR
+    //! and the shared temp DB are never accessed concurrently.
+    use super::*;
+
+    #[test]
+    fn conversational_end_to_end() {
+        // Throwaway DB dir — never touch the user's real data.
+        let dir = std::env::temp_dir().join(format!("finny_conv_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("FINNY_DATA_DIR", &dir);
+
+        let e = Engine::new(false).unwrap(); // network OFF
+        let sid = e.list_sessions().unwrap().first().map(|s| s.id);
+
+        // Send a question and read back the assistant reply that was persisted.
+        let ask = |q: &str| -> String {
+            e.handle_chat(q, sid);
+            e.history_for(sid)
+                .unwrap()
+                .into_iter()
+                .filter(|m| m.role == "assistant")
+                .last()
+                .map(|m| m.text)
+                .unwrap_or_default()
+        };
+
+        // 1. Greetings → friendly, no placeholder/dead-end.
+        for q in ["hi", "hello finny", "hey"] {
+            let r = ask(q);
+            assert!(!r.contains("((region))"), "{:?} leaked placeholder: {}", q, r);
+            assert!(!r.contains("Not in local cache"), "{:?} dead-end: {}", q, r);
+            assert!(r.to_lowercase().contains("finny"), "{:?} not a greeting: {}", q, r);
+        }
+
+        // 2. Capabilities / identity.
+        let cap = ask("what can you do");
+        assert!(cap.contains("convert") || cap.contains("CPI"), "capabilities: {}", cap);
+        let id = ask("who are you");
+        assert!(id.to_lowercase().contains("finny"), "identity: {}", id);
+
+        // 3. Finance answer: substance kept, boilerplate stripped, source footer present.
+        let cpi = ask("latest US CPI");
+        assert!(cpi.contains("3.0%"), "missing data: {}", cpi);
+        assert!(!cpi.contains("## Reliability note"), "boilerplate kept: {}", cpi);
+        assert!(!cpi.contains("## Observed fact"), "boilerplate kept: {}", cpi);
+        assert!(cpi.to_lowercase().contains("source"), "no source footer: {}", cpi);
+
+        // 4. Calculator keeps its result.
+        let bond = ask("calculate bond duration D=7 and 25bp");
+        assert!(bond.contains("-1.75%"), "calc result missing: {}", bond);
+
+        // 5. Typo'd query is rescued (geography recovered), not a dead-end.
+        let turky = ask("inflation in turky");
+        assert!(!turky.contains("((region))"), "placeholder leaked: {}", turky);
+        assert!(!turky.contains("# Answer — subject"), "dead-end: {}", turky);
+
+        // 6. The user's exact complaint must no longer dead-end.
+        let complaint = ask("hi finny. can you summarize recent policy rate changes?");
+        assert!(!complaint.contains("((region))"), "placeholder leaked: {}", complaint);
+        assert!(!complaint.contains("Not in local cache"), "dead-end: {}", complaint);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
